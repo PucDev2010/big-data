@@ -1,201 +1,216 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, when, lower, concat, lit, expr, count
-)
-from pyspark.ml.feature import (
-    VectorAssembler, StringIndexer, OneHotEncoder,
-    Tokenizer, HashingTF, IDF, StopWordsRemover
-)
+from pyspark.sql.functions import col, when, lower, lit, coalesce, regexp_extract
+
+from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml import Pipeline
-from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
 
 # ====================================================
-# PHẦN 1: KẾT NỐI CASSANDRA & ĐỌC DỮ LIỆU
+# 1. KHỞI TẠO SPARK SESSION
 # ====================================================
 spark = SparkSession.builder \
-    .appName("JobAttractiveness_Cassandra_Train") \
+    .appName("JobAttractiveness_Logistic_Optimization") \
     .config("spark.cassandra.connection.host", "cassandra") \
     .config("spark.cassandra.connection.port", "9042") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
 
-print(">>> Đang đọc dữ liệu từ Cassandra (job_analytics.job_postings)...")
-
-# Đọc dữ liệu từ bảng Cassandra
-raw_df = spark.read \
+# ====================================================
+# 2. ĐỌC DỮ LIỆU TỪ CASSANDRA
+# ====================================================
+print(">>> Đang đọc dữ liệu...")
+df_raw = spark.read \
     .format("org.apache.spark.sql.cassandra") \
     .options(table="job_postings", keyspace="job_analytics") \
     .load()
 
-# Kiểm tra nếu không có dữ liệu
-if raw_df.count() == 0:
-    print("!!! Bảng Cassandra đang trống. Hãy chạy Streaming để đẩy dữ liệu vào trước !!!")
-    spark.stop()
-    exit()
-
-print(f">>> Tìm thấy {raw_df.count()} bản ghi. Bắt đầu xử lý...")
+# Lọc bỏ các bản ghi rác nếu cần
+df = df_raw.filter(col("job_title").isNotNull())
 
 # ====================================================
-# PHẦN 2: DATA CLEANING & GÁN NHÃN (LABELING)
+# 3. DATA CLEANING & PRE-PROCESSING
 # ====================================================
 
-# 1. Xử lý Lương
-# Lưu ý: Trong Cassandra cột salary_min/max đã là Double, nhưng ta fillna cho chắc chắn
-df = raw_df.fillna(0, subset=["salary_min", "salary_max"])
-
-# Tính lại avg_salary (Dù ETL có thể đã tính, ta tính lại ở đây để đảm bảo logic P70/P50 nhất quán)
+# 3.1. Xử lý Lương (Salary): Ưu tiên salary_avg, nếu null thì lấy trung bình min/max, cuối cùng là 0
 df = df.withColumn(
-    "avg_salary_calc",
+    "salary_final",
+    coalesce(
+        col("salary_avg"), 
+        (col("salary_min") + col("salary_max")) / 2, 
+        lit(0.0)
+    )
+)
+
+# 3.2. Xử lý Kinh nghiệm (Experience): Ưu tiên exp_avg, nếu null thì 0
+df = df.withColumn(
+    "exp_final",
+    coalesce(col("exp_avg_year"), col("exp_min_year"), lit(0.0))
+)
+
+# 3.3. Xử lý chuỗi (Lower case để so sánh chuỗi chính xác)
+df = df.withColumn("city_lower", lower(col("city"))) \
+       .withColumn("job_fields_lower", lower(col("job_fields"))) \
+       .withColumn("job_title_lower", lower(col("job_title"))) \
+       .withColumn("pos_lower", lower(col("position_level")))
+
+# ====================================================
+# 4. LABEL ENGINEERING (TẠO NHÃN HOT/NO HOT)
+# ====================================================
+# Logic thảo luận:
+# 1. Hot kiểu hiệu suất: Lương >= 15tr VÀ Kinh nghiệm <= 2 năm
+# 2. Hot kiểu High-end: Lương >= 30tr (bất chấp kinh nghiệm)
+# Còn lại là 0
+
+df = df.withColumn(
+    "is_hot",
     when(
-        (col("salary_min") > 0) & (col("salary_max") > 0),
-        (col("salary_min") + col("salary_max")) / 2
-    ).otherwise(col("salary_min"))
+        ((col("salary_final") >= 15.0) & (col("exp_final") <= 2.0)), 1.0
+    ).when(
+        (col("salary_final") >= 30.0), 1.0
+    ).otherwise(0.0)
 )
 
-# 2. Xử lý Kinh nghiệm (Regex -> Số năm)
-# Cần xử lý null cho cột experience trước khi chạy rlike
-df = df.fillna("", subset=["experience"])
+# Kiểm tra phân bố nhãn
+print(">>> Phân bố nhãn (0: No Hot, 1: Hot):")
+df.groupBy("is_hot").count().show()
 
+# ====================================================
+# 5. FEATURE ENGINEERING (TẠO BIẾN ĐẦU VÀO X)
+# ====================================================
+
+# Feature 1: Hiệu suất Lương (Salary per Experience Ratio)
+# Công thức: Lương / (Năm kinh nghiệm + 1). Cộng 1 để tránh chia cho 0.
+df = df.withColumn("salary_per_exp", col("salary_final") / (col("exp_final") + 1.0))
+
+# Feature 2: Big City (Tier 1)
+# 1 nếu ở HCM/HN, 0 nếu ở tỉnh khác
 df = df.withColumn(
-    "experience_years",
-    when(col("experience").rlike("chưa có|không yêu cầu"), 0)
-    .when(col("experience").rlike("lên đến 1"), 1)
-    .when(col("experience").rlike("trên 1"), 2)
-    .when(col("experience").rlike("1 - 2"), 1.5)
-    .when(col("experience").rlike("1 - 3"), 2)
-    .when(col("experience").rlike("2 - 5"), 3.5)
-    .when(col("experience").rlike("3 - 5"), 4)
-    .when(col("experience").rlike("5 - 7"), 6)
-    .when(col("experience").rlike("5 - 15"), 10)
-    .otherwise(2) # Mặc định
+    "is_big_city",
+    when(col("city_lower").rlike("hồ chí minh|hà nội|hcm|ha noi"), 1.0).otherwise(0.0)
 )
 
-# 3. Phân nhóm vị trí
-df = df.fillna("Unknown", subset=["position_level"]) # Xử lý null
+# Feature 3: Is Manager/Lead (Dựa trên Job Title hoặc Position Level)
 df = df.withColumn(
-    "position_group_label",
-    when(lower(col("position_level")).rlike("quản lý|giám đốc|phó giám đốc"), "SENIOR")
-    .when(lower(col("position_level")).rlike("trưởng nhóm|giám sát"), "MID")
-    .otherwise("ENTRY")
+    "is_manager",
+    when(
+        col("job_title_lower").rlike("trưởng|quản lý|giám đốc|manager|lead|head") | 
+        col("pos_lower").rlike("trưởng|quản lý|giám đốc"), 
+        1.0
+    ).otherwise(0.0)
 )
 
-# 4. Tính ngưỡng lương (P50, P70)
-quantiles = df.stat.approxQuantile("avg_salary_calc", [0.5, 0.7], 0.01)
-P50, P70 = quantiles[0], quantiles[1]
-print(f"--- NGƯỠNG LƯƠNG TỪ DB: Median={P50}, Top30%={P70} ---")
-
-# 5. Tạo cột LABEL: is_attractive
+# Feature 4: Is Tech Job (Ngành công nghệ)
 df = df.withColumn(
-    "is_attractive",
-    when(col("avg_salary_calc") >= P70, 1)  # Lương cao
-    .when(col("position_group_label").isin("MID", "SENIOR"), 1) # Chức vụ cao
-    .when((col("experience_years") <= 1) & (col("avg_salary_calc") >= P50), 1) # Lương tốt cho người mới
-    .otherwise(0)
+    "is_tech",
+    when(col("job_fields_lower").rlike("cntt|it|phần mềm|developer|kỹ sư|data|ai"), 1.0).otherwise(0.0)
 )
 
-# ====================================================
-# PHẦN 3: FEATURE ENGINEERING
-# ====================================================
-
-# 1. Làm sạch dữ liệu đầu vào cho Model
-df_clean = df.filter(col("job_title").isNotNull()) \
-             .fillna({
-                 'skills': '',
-                 'job_title': '',
-                 'job_fields': '',
-                 'city': 'Unknown',
-                 'position_level': 'Unknown'
-             })
-
-# 2. Gộp Text Features
-df_clean = df_clean.withColumn(
-    "full_text_features",
-    expr("concat(job_title, ' ', skills, ' ', job_fields)")
+# Feature 5: Is Sales/Biz Job (Ngành Sales/Kinh doanh - thường biến động cao)
+df = df.withColumn(
+    "is_sales",
+    when(col("job_fields_lower").rlike("kinh doanh|bán hàng|sales|tiếp thị|marketing"), 1.0).otherwise(0.0)
 )
 
-# 3. Chia dữ liệu Train/Test
-train_data, test_data = df_clean.randomSplit([0.8, 0.2], seed=42)
-
-# ====================================================
-# PHẦN 4: XÂY DỰNG ML PIPELINE
-# ====================================================
-
-# A. Categorical Features
-city_indexer = StringIndexer(inputCol="city", outputCol="city_idx", handleInvalid="keep")
-city_encoder = OneHotEncoder(inputCols=["city_idx"], outputCols=["city_vec"])
-
-pos_indexer = StringIndexer(inputCol="position_level", outputCol="pos_idx", handleInvalid="keep")
-pos_encoder = OneHotEncoder(inputCols=["pos_idx"], outputCols=["pos_vec"])
-
-# B. Text Features
-tokenizer = Tokenizer(inputCol="full_text_features", outputCol="words_raw")
-vi_stopwords = [
-    "của", "và", "các", "có", "làm", "tại", "trong", "được", "với", "là",
-    "người", "những", "cho", "về", "nhân viên", "công ty", "tuyển", "gấp",
-    "hcm", "hn", "lương", "tháng", "nam", "nữ", "mô tả", "yêu cầu", "chi nhánh"
+# Chọn các cột Features để đưa vào Vector
+feature_cols = [
+    "salary_final",     # Lương gốc
+    "exp_final",        # Kinh nghiệm gốc
+    "salary_per_exp",   # Chỉ số phái sinh quan trọng
+    "is_big_city",      # Địa điểm
+    "is_manager",       # Cấp bậc
+    "is_tech",          # Ngành Tech
+    "is_sales"          # Ngành Sales
 ]
-remover = StopWordsRemover(inputCol="words_raw", outputCol="words_clean", stopWords=vi_stopwords)
-hashingTF = HashingTF(inputCol="words_clean", outputCol="tf_features", numFeatures=3000)
-idf = IDF(inputCol="tf_features", outputCol="text_vec")
 
-# C. Assemble Vectors
+# Chia tập train/test
+train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+
+# ====================================================
+# 6. ML PIPELINE
+# ====================================================
+
+# Bước 1: Gom các feature thành 1 vector
 assembler = VectorAssembler(
-    inputCols=["experience_years", "city_vec", "pos_vec", "text_vec"],
-    outputCol="features"
+    inputCols=feature_cols,
+    outputCol="features_raw"
 )
 
-# D. Model Logistic Regression
+# Bước 2: Chuẩn hóa dữ liệu (StandardScaler)
+# Logistic Regression rất nhạy cảm với biên độ dữ liệu (Lương 20.000.000 vs Feature là 0/1)
+# Cần đưa về cùng 1 scale để thuật toán hội tụ tốt hơn.
+scaler = StandardScaler(
+    inputCol="features_raw",
+    outputCol="features",
+    withStd=True,
+    withMean=True
+)
+
+# Bước 3: Model Logistic Regression
 lr = LogisticRegression(
-    labelCol="is_attractive",
+    labelCol="is_hot",
     featuresCol="features",
-    regParam=0.01,
-    elasticNetParam=0.8
+    maxIter=100,
+    regParam=0.01,       # L2 Regularization để tránh Overfitting
+    elasticNetParam=0.0  # 0 là L2 (Ridge), 1 là L1 (Lasso)
 )
 
-# E. Pipeline
-pipeline = Pipeline(stages=[
-    city_indexer, city_encoder,
-    pos_indexer, pos_encoder,
-    tokenizer, remover, hashingTF, idf,
-    assembler,
-    lr
-])
+pipeline = Pipeline(stages=[assembler, scaler, lr])
 
 # ====================================================
-# PHẦN 5: TRAIN & ĐÁNH GIÁ
+# 7. TRAIN & EVALUATE
 # ====================================================
-
-print(">>> Đang huấn luyện mô hình...")
-model = pipeline.fit(train_data)
+print(">>> Bắt đầu huấn luyện...")
+model = pipeline.fit(train_df)
 print(">>> Huấn luyện xong!")
 
-# ----------------------------------------------------
-# [MỚI] PHẦN LƯU MODEL (SAVE)
-# ----------------------------------------------------
-# Đường dẫn lưu: Lưu vào thư mục 'models' nằm trong 'app'
-# Trong Docker nó là /opt/spark/work-dir/models/...
-# Trên Windows nó sẽ hiện ở: D:\UIT\...\project\spark\app\models\...
-model_path = "/opt/spark/work-dir/models/job_attractiveness_v1"
+# Dự đoán trên tập test
+predictions = model.transform(test_df)
 
-print(f">>> Đang lưu model vào: {model_path}")
-
-# overwrite(): Ghi đè nếu folder đã tồn tại (tiện khi chạy lại nhiều lần)
-model.write().overwrite().save(model_path)
-
-print(">>> Đã lưu model thành công!")
-
-# ----------------------------------------------------
-# Đánh giá (Giữ nguyên)
-# ----------------------------------------------------
-predictions = model.transform(test_data)
-evaluator_auc = BinaryClassificationEvaluator(labelCol="is_attractive", metricName="areaUnderROC")
+# Đánh giá
+evaluator_auc = BinaryClassificationEvaluator(labelCol="is_hot", metricName="areaUnderROC")
 auc = evaluator_auc.evaluate(predictions)
 
-print(f"\n================ KẾT QUẢ ===================")
+evaluator_acc = MulticlassClassificationEvaluator(labelCol="is_hot", metricName="accuracy")
+acc = evaluator_acc.evaluate(predictions)
+
+print("\n" + "="*30)
+print(f"KẾT QUẢ ĐÁNH GIÁ MÔ HÌNH")
+print("="*30)
 print(f"Area Under ROC (AUC): {auc:.4f}")
-print(f"Model saved at: {model_path}")
-print(f"============================================")
+print(f"Accuracy:           {acc:.4f}")
+
+# ====================================================
+# 8. PHÂN TÍCH TRỌNG SỐ (COEFFICIENTS)
+# ====================================================
+# Phần này cực kỳ quan trọng để bạn giải thích cho Đồ án
+# Nó cho biết yếu tố nào ảnh hưởng nhất đến việc 1 job là HOT
+
+lr_model = model.stages[-1] # Lấy model LR từ pipeline
+coeffs = lr_model.coefficients.toArray()
+intercept = lr_model.intercept
+
+print("\n" + "="*30)
+print("GIẢI THÍCH TRỌNG SỐ (IMPORTANCE)")
+print("="*30)
+print("(Dương: Tác động tích cực tới độ HOT | Âm: Tác động tiêu cực)")
+
+feature_importance = list(zip(feature_cols, coeffs))
+# Sắp xếp theo độ lớn tuyệt đối của trọng số
+feature_importance.sort(key=lambda x: abs(x[1]), reverse=True)
+
+for feature, weight in feature_importance:
+    impact = "TĂNG cơ hội Hot" if weight > 0 else "GIẢM cơ hội Hot"
+    print(f"{feature:.<20} {weight:.4f}  --> {impact}")
+
+print(f"\nIntercept (Hệ số chặn): {intercept:.4f}")
+
+# ====================================================
+# 9. LƯU MÔ HÌNH
+# ====================================================
+model_path = "/opt/spark/work-dir/models/job_attractiveness_logistic_v2"
+model.write().overwrite().save(model_path)
+print(f"\n>>> Đã lưu model tại: {model_path}")
 
 spark.stop()

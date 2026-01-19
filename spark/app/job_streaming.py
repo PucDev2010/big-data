@@ -1,6 +1,10 @@
 import logging
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, to_timestamp, when, expr
+from pyspark.sql.functions import (
+    col, when, expr, lit,
+    to_timestamp, lower, regexp_extract,
+    from_json
+)
 from pyspark.sql.types import *
 
 # Cấu hình Logging để dễ theo dõi
@@ -48,13 +52,92 @@ parsed_df = raw_df.select(
 ).select("data.*")
 
 # Thực hiện các bước làm sạch và biến đổi dữ liệu
-etl_df = parsed_df \
-    .filter(col("job_title").isNotNull()) \
-    .withColumn("event_time", to_timestamp("event_time")) \
-    .withColumn("salary_avg", (col("salary_min") + col("salary_max")) / 2) \
-    .withColumn("city", when(col("city") == "", "Unknown").otherwise(col("city"))) \
-    .fillna(0, subset=["salary_min", "salary_max", "salary_avg"]) \
-    .withColumn("id", expr("uuid()"))  # Tự sinh ID ngẫu nhiên (UUID)
+etl_df = (
+    parsed_df
+    .filter(col("job_title").isNotNull())
+    .withColumn("event_time", to_timestamp("event_time"))
+
+    # ===== SALARY =====
+    .withColumn(
+        "salary_avg",
+        when(
+            col("salary_min").isNotNull() & col("salary_max").isNotNull(),
+            (col("salary_min") + col("salary_max")) / 2
+        ).otherwise(lit(None))
+    )
+
+    # ===== CITY =====
+    .withColumn(
+        "city",
+        when(
+            (col("city") == "") | col("city").isNull(),
+            lit("Unknown")
+        ).otherwise(col("city"))
+    )
+
+    # ===== EXPERIENCE ETL =====
+    .withColumn("exp_raw", lower(col("experience")))
+
+    # ---- exp_min_year ----
+    .withColumn(
+        "exp_min_year",
+        when(col("exp_raw").contains("không yêu cầu"), lit(None))
+        .when(col("exp_raw").contains("chưa có"), lit(0.0))
+        .when(col("exp_raw").contains("mới tốt nghiệp"), lit(0.0))
+        .when(col("exp_raw").contains("lên đến"), lit(0.0))
+        .when(
+            col("exp_raw").contains("trên"),
+            regexp_extract(col("exp_raw"), r"(\d+)", 1).cast("double")
+        )
+        .when(
+            col("exp_raw").rlike(r"\d+\s*-\s*\d+"),
+            regexp_extract(col("exp_raw"), r"(\d+)\s*-\s*(\d+)", 1).cast("double")
+        )
+        .otherwise(lit(None))
+    )
+
+    # ---- exp_max_year ----
+    .withColumn(
+        "exp_max_year",
+        when(col("exp_raw").contains("không yêu cầu"), lit(None))
+        .when(col("exp_raw").contains("chưa có"), lit(0.0))
+        .when(col("exp_raw").contains("mới tốt nghiệp"), lit(1.0))
+        .when(
+            col("exp_raw").contains("lên đến"),
+            regexp_extract(col("exp_raw"), r"(\d+)", 1).cast("double")
+        )
+        .when(col("exp_raw").contains("trên"), lit(None))
+        .when(
+            col("exp_raw").rlike(r"\d+\s*-\s*\d+"),
+            regexp_extract(col("exp_raw"), r"(\d+)\s*-\s*(\d+)", 2).cast("double")
+        )
+        .otherwise(lit(None))
+    )
+
+    # ---- exp_avg_year ----
+    .withColumn(
+        "exp_avg_year",
+        when(
+            col("exp_min_year").isNotNull() & col("exp_max_year").isNotNull(),
+            (col("exp_min_year") + col("exp_max_year")) / 2
+        ).otherwise(lit(None))
+    )
+
+    # ---- exp_type ----
+    .withColumn(
+        "exp_type",
+        when(col("exp_raw").contains("không yêu cầu"), lit("no_requirement"))
+        .when(col("exp_raw").contains("chưa có"), lit("no_experience"))
+        .when(col("exp_raw").contains("mới tốt nghiệp"), lit("fresh_graduate"))
+        .when(col("exp_raw").contains("lên đến"), lit("upper_bound"))
+        .when(col("exp_raw").contains("trên"), lit("lower_bound"))
+        .when(col("exp_raw").rlike(r"\d+\s*-\s*\d+"), lit("range"))
+        .otherwise(lit("unknown"))
+    )
+
+    # ===== ID =====
+    .withColumn("id", expr("uuid()"))
+)
 
 #Ghi dữ liệu vào Cassandra
 logger.info("Ghi du lieu vao Cassandra...")
