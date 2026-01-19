@@ -1,0 +1,2 @@
+v1
+{"path":"file:///opt/spark/work-dir/output_data/part-00000-64f13114-ee8d-4513-9268-e2fa9afe3456-c000.csv","size":124,"isDir":false,"modificationTime":1768575809004,"blockReplication":1,"blockSize":33554432,"action":"add"}
