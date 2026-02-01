@@ -26,7 +26,9 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
   spark-master:
-    image: apache/spark:3.5.3
+    build:
+      context: .
+      dockerfile: ./spark/Dockerfile.spark
     container_name: spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     ports:
@@ -41,7 +43,9 @@ services:
        
 
   spark-worker:
-    image: apache/spark:3.5.3
+    build:
+      context: .
+      dockerfile: ./spark/Dockerfile.spark
     container_name: spark-worker
     depends_on:
       - spark-master
@@ -73,6 +77,27 @@ services:
       interval: 15s
       timeout: 10s
       retries: 5
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: ./spark/Dockerfile.streamlit
+    container_name: streamlit
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - JAVA_HOME=/opt/java/openjdk
+      - CASSANDRA_HOST=cassandra
+      - CASSANDRA_PORT=9042
+    volumes:
+      - ./spark/app:/app
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   cassandra_data: # Định nghĩa volume để lưu dữ liệu bền vững

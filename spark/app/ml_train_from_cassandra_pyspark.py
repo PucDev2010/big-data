@@ -130,6 +130,7 @@ class MLTrainerFromCassandraPySpark:
         # Specifically suppress CqlRequestHandler query logs
         log4j.LogManager.getLogger("com.datastax.oss.driver.internal.core.cql.CqlRequestHandler").setLevel(log4j.Level.ERROR)
         self.model = None
+        self.scaler = None
         self.pipeline = None
 
     def _disable_hadoop_native_io(self):
@@ -305,6 +306,7 @@ class MLTrainerFromCassandraPySpark:
             withMean=True
         )
         scaler_model = scaler.fit(train_df)
+        self.scaler = scaler_model  # Store scaler for later use
         train_df = scaler_model.transform(train_df)
         test_df = scaler_model.transform(test_df)
         print("✓ Features scaled")
@@ -643,6 +645,21 @@ class MLTrainerFromCassandraPySpark:
             
             model = RandomForestRegressionModel.load(model_path)
             self.model = model
+            
+            # Also try to load the scaler (if it exists)
+            scaler_path = model_path + "_scaler"
+            if os.path.exists(scaler_path):
+                from pyspark.ml.feature import StandardScalerModel
+                try:
+                    self.scaler = StandardScalerModel.load(scaler_path)
+                    print(f"✓ Scaler loaded successfully")
+                except Exception as e:
+                    print(f"⚠ Warning: Could not load scaler: {e}")
+                    self.scaler = None
+            else:
+                print(f"⚠ Warning: Scaler not found at {scaler_path}. Predictions may fail.")
+                self.scaler = None
+            
             print(f"✓ Model loaded successfully")
             return model
         except Exception as e:
@@ -790,11 +807,36 @@ class MLTrainerFromCassandraPySpark:
             # Create DataFrame
             input_df = self.spark.createDataFrame([row])
             
-            # Apply feature transformations (you may need to load and apply scaler)
-            # For now, assuming features are already prepared
-            # You'll need to apply the same preprocessing pipeline used during training
+            # Apply feature transformations (same as training)
+            # Step 1: Assemble features into a vector
+            from pyspark.ml.feature import VectorAssembler
+            feature_cols = [
+                'city_encoded',
+                'job_type_encoded',
+                'position_encoded',
+                'experience_encoded',
+                'num_skills',
+                'num_fields',
+                'title_length'
+            ]
             
-            # Make prediction
+            assembler = VectorAssembler(
+                inputCols=feature_cols,
+                outputCol='features',
+                handleInvalid='skip'
+            )
+            input_df = assembler.transform(input_df)
+            
+            # Step 2: Scale features (if scaler is available)
+            if hasattr(self, 'scaler') and self.scaler is not None:
+                input_df = self.scaler.transform(input_df)
+            else:
+                # If scaler not available, use features directly (may cause issues)
+                # Try to create a dummy scaler or use features as-is
+                print("⚠ Warning: Scaler not available. Using unscaled features.")
+                input_df = input_df.withColumn('scaled_features', col('features'))
+            
+            # Make prediction (model expects 'scaled_features' column)
             prediction = model.transform(input_df)
             result = prediction.select("prediction").first()
             
@@ -930,6 +972,11 @@ def main():
     try:
         model.write().overwrite().save(model_save_path)
         print(f"✓ Model saved successfully to {model_save_path}")
+        
+        # Also save the scaler (needed for predictions)
+        scaler_save_path = model_save_path + "_scaler"
+        scaler.write().overwrite().save(scaler_save_path)
+        print(f"✓ Scaler saved successfully to {scaler_save_path}")
         
         # Verify the model was saved correctly
         metadata_path = os.path.join(model_save_path, "metadata")
