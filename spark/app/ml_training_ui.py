@@ -2218,6 +2218,15 @@ with tab6:
                     saved_path, saved_components = recommender.save_model(model_path=model_save_path)
                     if saved_path:
                         st.success(f"✓ Models saved to {saved_path}")
+                        
+                        # Save model metadata to Cassandra
+                        st.info("Saving model metadata to Cassandra...")
+                        model_id = recommender.save_model_metadata(
+                            model_name="Skills_Recommender_W2V_LDA",
+                            model_path=saved_path
+                        )
+                        if model_id:
+                            st.success(f"✓ Model metadata saved to Cassandra (ID: {model_id[:8]}...)")
                     
                     # Store in session state
                     st.session_state.skills_recommender = recommender
