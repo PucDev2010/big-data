@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 # Khởi tạo Spark Session với cấu hình Cassandra
 spark = SparkSession.builder \
     .appName("KafkaToCassandra_ETL") \
+    .config("spark.jars.packages", "com.datastax.spark:spark-cassandra-connector_2.12:3.5.0") \
     .config("spark.cassandra.connection.host", "cassandra") \
     .config("spark.cassandra.connection.port", "9042") \
     .getOrCreate()
@@ -44,6 +45,7 @@ raw_df = spark.readStream \
     .option("kafka.bootstrap.servers", "kafka:9092") \
     .option("subscribe", "job_postings") \
     .option("startingOffsets", "latest") \
+    .option("failOnDataLoss", "false") \
     .load()
 
 #Parse JSON & ETL dữ liệu
