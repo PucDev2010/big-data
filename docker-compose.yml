@@ -48,12 +48,30 @@ services:
       - ./spark/app:/opt/spark/work-dir
       - ./spark/ivy:/home/spark/.ivy2
 
-  # --- PHẦN MỚI THÊM: CASSANDRA ---
+  # --- STREAMLIT DASHBOARD ---
+  streamlit:
+    image: python:3.11-slim
+    container_name: streamlit
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./spark/app:/app
+    working_dir: /app
+    command: >
+      bash -c "pip install streamlit pandas plotly cassandra-driver &&
+               streamlit run streamlit_app.py --server.address=0.0.0.0"
+    environment:
+      - CASSANDRA_HOST=cassandra
+
+  # --- CASSANDRA ---
   cassandra:
     image: cassandra:4.1
     container_name: cassandra
     ports:
-      - "9042:9042"  # Cổng để kết nối từ bên ngoài (DBeaver, code Python trên máy host)
+      - "9042:9042"
     environment:
       - CASSANDRA_CLUSTER_NAME=BigDataProject
       - CASSANDRA_DC=datacenter1
@@ -67,4 +85,4 @@ services:
       retries: 5
 
 volumes:
-  cassandra_data: # Định nghĩa volume để lưu dữ liệu bền vững
+  cassandra_data:

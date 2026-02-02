@@ -1,172 +1,271 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, expr, when, lower, regexp_replace
-from pyspark.ml.feature import (
-    VectorAssembler, StringIndexer, OneHotEncoder,
-    Tokenizer, HashingTF, IDF, StopWordsRemover
-)
+from pyspark.sql.functions import *
+from pyspark.ml.feature import VectorAssembler, StandardScaler
 from pyspark.ml.regression import GBTRegressor
 from pyspark.ml import Pipeline
 from pyspark.ml.evaluation import RegressionEvaluator
 
 # ====================================================
-# 1. KHỞI TẠO SPARK & KẾT NỐI CASSANDRA
+# 1. KHỞI TẠO SPARK SESSION
 # ====================================================
 spark = SparkSession.builder \
-    .appName("JobSalary_GBT_Cassandra") \
+    .appName("SkillHotScore_GBT_Regressor") \
     .config("spark.cassandra.connection.host", "cassandra") \
     .config("spark.cassandra.connection.port", "9042") \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
 
+# ====================================================
+# 2. ĐỌC DỮ LIỆU TỪ CASSANDRA
+# ====================================================
 print(">>> Đang đọc dữ liệu từ Cassandra...")
-# Đọc dữ liệu từ bảng job_postings trong keyspace job_analytics
-raw_df = spark.read \
+df = spark.read \
     .format("org.apache.spark.sql.cassandra") \
     .options(table="job_postings", keyspace="job_analytics") \
     .load()
 
-# Kiểm tra dữ liệu
-if raw_df.count() == 0:
-    print("!!! Lỗi: Bảng Cassandra trống rỗng. Hãy chạy Streaming trước.")
-    spark.stop()
-    exit()
-
-print("=== SCHEMA TỪ CASSANDRA ===")
-raw_df.printSchema()
+print(f">>> Tổng số jobs: {df.count()}")
 
 # ====================================================
-# 2. XỬ LÝ DỮ LIỆU (ETL)
+# 3. TIỀN XỬ LÝ DỮ LIỆU
 # ====================================================
+print(">>> Đang tiền xử lý dữ liệu...")
 
-# A. Xử lý Lương & Tính Trung Bình
-# Trong Cassandra, salary_min/max thường đã là Double, nhưng ta fillna(0) cho chắc ăn
-df = raw_df.fillna(0, subset=["salary_min", "salary_max"])
-
-df = df.withColumn(
-    "avg_salary",
-    when((col("salary_min") > 0) & (col("salary_max") > 0), (col("salary_min") + col("salary_max")) / 2)
-    .when((col("salary_min") > 0) & (col("salary_max") == 0), col("salary_min"))
-    .when((col("salary_min") == 0) & (col("salary_max") > 0), col("salary_max"))
-    .otherwise(0)
+df = df.select(
+    "id",
+    lower(col("city")).alias("city"),
+    col("salary_avg").cast("double"),
+    col("exp_avg_year").cast("double"),
+    col("skills"),
+    "event_time"
 )
 
-# B. Lọc sạch dữ liệu (Data Cleaning) - QUAN TRỌNG
-# 1. Loại bỏ các job trùng lặp (dựa trên job_title)
-# 2. Chỉ lấy các job có lương hợp lý (ví dụ: > 0) để Model học tốt hơn
-# 3. Điền giá trị rỗng cho các cột text để tránh lỗi NullPointerException khi chạy Tokenizer
-df_clean = df.filter(col("avg_salary") > 0) \
-    .filter(col("job_title").isNotNull()) \
-    .fillna({
-        'skills': '', 
-        'job_title': '', 
-        'job_fields': '', 
-        'city': 'Unknown', 
-        'position_level': 'Unknown',
-        'experience': 'Không yêu cầu'
-    })
+df = df.fillna({
+    "salary_avg": 0.0,
+    "exp_avg_year": 0.0,
+    "skills": ""
+})
 
-print(f">>> Số lượng bản ghi sạch dùng để train: {df_clean.count()}")
-
-# C. Xử lý kinh nghiệm (Regex -> Số năm)
-df_clean = df_clean.withColumn(
-    "experience_years",
-    when(col("experience").rlike("chưa có|không yêu cầu"), 0)
-    .when(col("experience").rlike("lên đến 1"), 1)
-    .when(col("experience").rlike("trên 1"), 2)
-    .when(col("experience").rlike("1 - 2"), 1.5)
-    .when(col("experience").rlike("1 - 3"), 2)
-    .when(col("experience").rlike("2 - 5"), 3.5)
-    .when(col("experience").rlike("3 - 5"), 4)
-    .when(col("experience").rlike("5 - 7"), 6)
-    .when(col("experience").rlike("5 - 15"), 10)
-    .otherwise(2)
-)
-
-# D. Tạo Full Text Features (Gộp cột)
-df_clean = df_clean.withColumn(
-    "full_text_features", 
-    expr("concat(job_title, ' ', skills, ' ', job_fields)")
-)
-
-# Chia tập dữ liệu Train/Test
-train_data, test_data = df_clean.randomSplit([0.8, 0.2], seed=42)
+# Lọc bỏ jobs không có skills
+df = df.filter(col("skills") != "")
 
 # ====================================================
-# 3. XÂY DỰNG PIPELINE ML
+# 4. TÁCH VÀ PHÂN TÍCH TỪNG KỸ NĂNG
 # ====================================================
+print(">>> Đang phân tích kỹ năng...")
 
-# City Handling
-city_indexer = StringIndexer(inputCol="city", outputCol="city_idx", handleInvalid="keep")
-city_encoder = OneHotEncoder(inputCols=["city_idx"], outputCols=["city_vec"])
+# Explode skills thành từng dòng riêng
+skill_df = df.withColumn(
+    "skill",
+    explode(split(lower(col("skills")), ","))
+)
 
-# Position Handling
-pos_indexer = StringIndexer(inputCol="position_level", outputCol="pos_idx", handleInvalid="keep")
-pos_encoder = OneHotEncoder(inputCols=["pos_idx"], outputCols=["pos_vec"])
+# Làm sạch skill
+skill_df = skill_df.withColumn("skill", trim(col("skill"))) \
+                   .filter(col("skill") != "") \
+                   .filter(length(col("skill")) > 1)  # Bỏ skill quá ngắn
 
-# Text Handling (TF-IDF)
-tokenizer = Tokenizer(inputCol="full_text_features", outputCol="words_raw")
-vi_stopwords = [
-    "của", "và", "các", "có", "làm", "tại", "trong", "được", "với", "là", 
-    "người", "nhân viên", "công ty", "tuyển", "hcm", "hn", "lương", "tháng", 
-    "yêu cầu", "mô tả", "chi nhánh", "trách nhiệm", "quyền lợi"
-]
-remover = StopWordsRemover(inputCol="words_raw", outputCol="words_clean", stopWords=vi_stopwords)
-hashingTF = HashingTF(inputCol="words_clean", outputCol="tf_features", numFeatures=3000)
-idf = IDF(inputCol="tf_features", outputCol="text_vec")
+# Thêm feature: thành phố lớn
+skill_df = skill_df.withColumn(
+    "is_big_city",
+    when(col("city").rlike("hồ chí minh|hà nội|hcm|ha noi"), 1.0).otherwise(0.0)
+)
 
-# Vector Assembler
+# ====================================================
+# 5. TỔNG HỢP THỐNG KÊ CHO TỪNG KỸ NĂNG
+# ====================================================
+print(">>> Đang tổng hợp thống kê...")
+
+skill_agg = skill_df.groupBy("skill").agg(
+    count("*").alias("job_count"),
+    avg("salary_avg").alias("avg_salary"),
+    avg("exp_avg_year").alias("avg_exp"),
+    avg("is_big_city").alias("big_city_ratio")
+)
+
+# Lọc chỉ giữ các skill phổ biến (ít nhất 10 jobs)
+skill_agg = skill_agg.filter(col("job_count") >= 10)
+
+print(f">>> Số kỹ năng phân tích: {skill_agg.count()}")
+
+# ====================================================
+# 6. TÍNH SKILL HOT SCORE (LABEL)
+# ====================================================
+# Công thức: hot_score = 0.4*salary + 0.3*demand - 0.2*exp + 0.1*city
+# Giải thích:
+# - Lương cao (40%): Kỹ năng trả lương cao = hấp dẫn
+# - Demand cao (30%): Nhiều jobs yêu cầu = hấp dẫn
+# - Kinh nghiệm thấp (-20%): Dễ học = hấp dẫn cho người mới
+# - Thành phố lớn (10%): Có ở thành phố lớn = hấp dẫn
+
+skill_agg = skill_agg.withColumn(
+    "salary_norm", col("avg_salary") / 100.0  # Chuẩn hóa về 0-1
+).withColumn(
+    "demand_norm", least(col("job_count") / 100.0, lit(1.0))  # Chuẩn hóa, max = 1
+).withColumn(
+    "exp_norm", col("avg_exp") / 10.0  # Chuẩn hóa về 0-1
+)
+
+skill_agg = skill_agg.withColumn(
+    "skill_hot_score",
+    0.4 * col("salary_norm") +
+    0.3 * col("demand_norm") -
+    0.2 * col("exp_norm") +
+    0.1 * col("big_city_ratio")
+)
+
+# ====================================================
+# 7. CHUẨN BỊ FEATURES CHO ML
+# ====================================================
+feature_cols = ["avg_salary", "job_count", "avg_exp", "big_city_ratio"]
+
 assembler = VectorAssembler(
-    inputCols=["experience_years", "city_vec", "pos_vec", "text_vec"],
-    outputCol="features"
+    inputCols=feature_cols,
+    outputCol="features_raw"
 )
 
-# GBT Regressor Model
+scaler = StandardScaler(
+    inputCol="features_raw",
+    outputCol="features",
+    withStd=True,
+    withMean=True
+)
+
+# ====================================================
+# 8. CHIA TRAIN/TEST (80/20)
+# ====================================================
+print("\n>>> CHIA DỮ LIỆU TRAIN/TEST (80/20):")
+train_data, test_data = skill_agg.randomSplit([0.8, 0.2], seed=42)
+print(f"    - Tổng số skills: {skill_agg.count()}")
+print(f"    - Train set (80%): {train_data.count()} skills")
+print(f"    - Test set (20%): {test_data.count()} skills")
+
+# ====================================================
+# 9. XÂY DỰNG MODEL GBT REGRESSOR
+# ====================================================
 gbt = GBTRegressor(
-    labelCol="avg_salary",
     featuresCol="features",
-    maxIter=100,   # Giảm xuống 50 để train nhanh hơn demo (thực tế để 100)
-    maxDepth=8,
-    stepSize=0.05
+    labelCol="skill_hot_score",
+    maxIter=50,
+    maxDepth=5,
+    seed=42
 )
 
-# Pipeline
-pipeline = Pipeline(stages=[
-    city_indexer, city_encoder,
-    pos_indexer, pos_encoder,
-    tokenizer, remover, hashingTF, idf,
-    assembler,
-    gbt
-])
+# Tạo Pipeline
+pipeline = Pipeline(stages=[assembler, scaler, gbt])
 
 # ====================================================
-# 4. TRAIN & EVALUATE
+# 10. TRAIN MODEL
 # ====================================================
-print(">>> Đang huấn luyện GBT Regressor...")
+print("\n>>> Đang train GBT Regressor...")
 model = pipeline.fit(train_data)
-print(">>> Huấn luyện xong!")
+print(">>> Train xong!")
 
-# Lưu model (Để tái sử dụng sau này)
-model_save_path = "/opt/spark/work-dir/models/gbt_salary_model"
-print(f">>> Đang lưu model vào: {model_save_path}")
-model.write().overwrite().save(model_save_path)
-
-# Dự báo trên tập Test
+# ====================================================
+# 11. DỰ ĐOÁN VÀ ĐÁNH GIÁ
+# ====================================================
+# Dự đoán trên test data
 predictions = model.transform(test_data)
 
-# Đánh giá
-evaluator_rmse = RegressionEvaluator(labelCol="avg_salary", predictionCol="prediction", metricName="rmse")
+# Đánh giá bằng RMSE và R²
+evaluator_rmse = RegressionEvaluator(
+    labelCol="skill_hot_score",
+    predictionCol="prediction",
+    metricName="rmse"
+)
 rmse = evaluator_rmse.evaluate(predictions)
 
-evaluator_r2 = RegressionEvaluator(labelCol="avg_salary", predictionCol="prediction", metricName="r2")
+evaluator_r2 = RegressionEvaluator(
+    labelCol="skill_hot_score",
+    predictionCol="prediction",
+    metricName="r2"
+)
 r2 = evaluator_r2.evaluate(predictions)
 
-print(f"\n================ KẾT QUẢ ===================")
-print(f"RMSE (Sai số trung bình): {rmse:.2f} (Triệu VNĐ)")
-print(f"R2 (Độ phù hợp mô hình): {r2:.2f}")
-print(f"============================================")
+evaluator_mae = RegressionEvaluator(
+    labelCol="skill_hot_score",
+    predictionCol="prediction",
+    metricName="mae"
+)
+mae = evaluator_mae.evaluate(predictions)
 
-print("\n--- TOP 10 DỰ BÁO VS THỰC TẾ (Lấy từ Cassandra) ---")
-predictions.select("job_title", "city", "experience_years", "avg_salary", "prediction").show(10, truncate=False)
+print("\n" + "="*50)
+print("KẾT QUẢ ĐÁNH GIÁ MODEL")
+print("="*50)
+print(f"RMSE (Root Mean Square Error): {rmse:.4f}")
+print(f"MAE (Mean Absolute Error):     {mae:.4f}")
+print(f"R² (Coefficient of Determination): {r2:.4f}")
+print("(R² càng gần 1 càng tốt)")
+
+# ====================================================
+# 12. DỰ ĐOÁN CHO TOÀN BỘ KỸ NĂNG
+# ====================================================
+print("\n>>> Dự đoán hot score cho toàn bộ kỹ năng...")
+all_predictions = model.transform(skill_agg)
+
+# ====================================================
+# 13. TOP KỸ NĂNG HẤP DẪN NHẤT
+# ====================================================
+print("\n" + "="*50)
+print("TOP 20 KỸ NĂNG HẤP DẪN NHẤT")
+print("="*50)
+all_predictions.select(
+    "skill",
+    round(col("prediction"), 4).alias("predicted_hot_score"),
+    "job_count",
+    round(col("avg_salary"), 1).alias("avg_salary"),
+    round(col("avg_exp"), 1).alias("avg_exp")
+).orderBy(desc("predicted_hot_score")).show(20, truncate=False)
+
+# ====================================================
+# 14. LƯU KẾT QUẢ VÀO CASSANDRA
+# ====================================================
+print("\n>>> Đang lưu kết quả vào Cassandra...")
+
+result_df = all_predictions.select(
+    col("skill"),
+    col("job_count").cast("int"),
+    col("avg_salary"),
+    col("avg_exp"),
+    col("big_city_ratio"),
+    col("skill_hot_score"),
+    col("prediction").alias("predicted_hot_score")
+)
+
+result_df.write \
+    .format("org.apache.spark.sql.cassandra") \
+    .option("keyspace", "job_analytics") \
+    .option("table", "skill_hot_scores") \
+    .option("confirm.truncate", "true") \
+    .mode("overwrite") \
+    .save()
+
+print(">>> Đã lưu vào table job_analytics.skill_hot_scores!")
+
+# ====================================================
+# 15. LƯU MODEL
+# ====================================================
+model_path = "/opt/spark/work-dir/models/skill_hot_gbt"
+model.write().overwrite().save(model_path)
+print(f"\n>>> Đã lưu model tại: {model_path}")
+
+# ====================================================
+# 16. PHÂN TÍCH FEATURE IMPORTANCE
+# ====================================================
+print("\n" + "="*50)
+print("FEATURE IMPORTANCE (ĐỘ QUAN TRỌNG CỦA FEATURES)")
+print("="*50)
+
+gbt_model = model.stages[-1]
+importances = gbt_model.featureImportances.toArray()
+
+feature_importance = list(zip(feature_cols, importances))
+feature_importance.sort(key=lambda x: x[1], reverse=True)
+
+for feature, importance in feature_importance:
+    bar = "█" * int(importance * 50)
+    print(f"{feature:.<20} {importance:.4f} {bar}")
 
 spark.stop()
+print("\n✅ HOÀN THÀNH!")

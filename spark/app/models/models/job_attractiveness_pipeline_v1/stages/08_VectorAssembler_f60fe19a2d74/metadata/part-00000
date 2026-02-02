@@ -1,0 +1,1 @@
+{"class":"org.apache.spark.ml.feature.VectorAssembler","timestamp":1768832978765,"sparkVersion":"3.5.3","uid":"VectorAssembler_f60fe19a2d74","paramMap":{"outputCol":"features","inputCols":["experience_years","city_vec","pos_vec","text_vec"]},"defaultParamMap":{"outputCol":"VectorAssembler_f60fe19a2d74__output","handleInvalid":"error"}}

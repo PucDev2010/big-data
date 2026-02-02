@@ -1,1 +1,0 @@
-{"class":"org.apache.spark.ml.feature.VectorAssembler","timestamp":1768834707113,"sparkVersion":"3.5.3","uid":"VectorAssembler_9461bba2c533","paramMap":{"inputCols":["salary_final","exp_final","salary_per_exp","is_big_city","is_manager","is_tech","is_sales"],"outputCol":"features_raw"},"defaultParamMap":{"handleInvalid":"error","outputCol":"VectorAssembler_9461bba2c533__output"}}

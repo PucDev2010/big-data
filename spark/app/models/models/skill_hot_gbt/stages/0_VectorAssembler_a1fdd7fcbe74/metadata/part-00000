@@ -1,0 +1,1 @@
+{"class":"org.apache.spark.ml.feature.VectorAssembler","timestamp":1769959599177,"sparkVersion":"3.5.3","uid":"VectorAssembler_a1fdd7fcbe74","paramMap":{"outputCol":"features_raw","inputCols":["avg_salary","job_count","avg_exp","big_city_ratio"]},"defaultParamMap":{"outputCol":"VectorAssembler_a1fdd7fcbe74__output","handleInvalid":"error"}}
